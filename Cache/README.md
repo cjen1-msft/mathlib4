@@ -134,42 +134,53 @@ see [`CI.md`](./CI.md).
 
 ### Experimental unpacked sharing
 
-On POSIX systems, run `MATHLIB_CACHE_UNPACKED=1 lake exe cache get ...` in a
-**downstream project** to share unpacked Mathlib compiler payloads across projects.
-This prototype requires `mktemp`, `ln`, and `chmod` on `PATH`. It does not require
-changes to Lake. It does not share the root project's outputs, other dependency
-packages, or entire build directories. The default extraction behavior is unchanged.
+Set `MATHLIB_CACHE_UNPACKED=1` in your shell or agent environment once. Ordinary
+`lake exe cache get ...` then automatically shares a canonical, read-only Mathlib
+**dependency build directory** across compatible projects, without project configuration.
+Mathlib source checkouts, root-project outputs and other dependencies remain private.
+The existing shared compressed `.ltar` cache is unchanged. This experiment requires
+POSIX `cp`, `rm`, `mktemp`, `ln`, `readlink`, and `chmod`; the default remains private extraction.
 
-Entries live in `$MATHLIB_CACHE_DIR/unpacked-v1/<module-cache-hash>/` (using the
-usual default cache directory when unset). The existing module hash includes source,
-transitive imports, toolchain, and package configuration. Each archive is extracted
-into a private temporary directory and atomically published. Concurrent preparations
-may extract twice but only one complete entry is published; later consumers reuse
-that unpacked entry without extraction, even after its `.ltar` is removed.
+Snapshots live in `$MATHLIB_CACHE_DIR/builds-v2/<identity>/` (using the usual cache
+directory when unset). Identity includes the exact clean Mathlib Git revision,
+Lean compiler commit, platform and requested module hashes. Those hashes cover source
+contents, imports, toolchain and Mathlib package configuration/dependency manifest.
+Local source/configuration changes select private restoration instead. Different requested
+module closures have separate snapshots; they are not incrementally merged.
 
-Only `.olean`, `.olean.server`, `.olean.private`, `.ilean`, `.ir`, `.ir.sig`, and
-`.c` payloads are linked, individually, using absolute symlinks. Stored payloads are
-read-only. Traces, hashes, and other bookkeeping are private copies. Old traces
-are removed before restoration and new traces installed last, so interrupted
-restoration causes a rebuild rather than reuse of mismatched outputs. Restoration
-replaces existing build outputs, including regular files; source edits are untouched.
-`get!` and `unpack!` extract privately and replace
-project links with regular writable copies; they never overwrite a published entry.
-Use a forced read before editing/rebuilding a linked Mathlib dependency if its build
-tools write outputs in place: such writes otherwise fail on the read-only target
-rather than corrupt another project. Project/root builds remain ordinary writable
-builds. Do not run builds and cache restoration concurrently in the **same** project.
-Disabling the option does not detach existing symlinks; keep it enabled for a forced
-read to obtain independent writable copies.
+On a miss, cache restoration prepares a private build. Lake rehashes and validates its
+existing modules before the complete build tree is captured, including the ordinary cache
+executable. The copy is frozen and atomically published; an interrupted preparation is never
+a visible snapshot. Concurrent preparers may duplicate work, but reuse one published entry.
+On a hit, one absolute symlink connects the dependency's `.lake/build` to that tree.
+Traces and hashes are shared **read-only too**: there is no per-file attachment or recovery.
+Reusing Mathlib needs neither its compressed archives nor another extraction.
 
-Cleaning one project's build tree does not affect another. Missing project links
-can be restored by an ordinary `get`; a damaged published entry instead reports an
-error and must be investigated, not overwritten in place. Do not move or remove
-the shared store while projects link to it. `cache clean`/`clean!` remove compressed
-archives only, not this store; this prototype has no shared-entry garbage collector.
-Killed preparations can leave ignored `.tmp.*` directories beneath `unpacked-v1`;
-remove only those abandoned directories once no cache processes are running.
-The store is trusted local user data, not a security boundary against that user.
+Attachment replaces this dependency's previous build outputs, not its sources.
+Before editing Mathlib, building additional targets, or changing its configuration, run
+`lake exe cache detach`. This removes only the build-directory link; subsequent builds
+recompute privately. `get!`, `unpack`, `unpack!`, and a decompression-enabled `get` with
+`MATHLIB_CACHE_UNPACKED=0` also detach before restoring privately. Merely unsetting the
+variable does not undo links without a cache invocation. `get-` downloads only and does
+not change an attachment. Mathlib's update hook detaches a snapshot before building
+the cache tool, including when `MATHLIB_NO_CACHE_ON_UPDATE=1`. This permits ordinary
+revision updates that change the tool itself. Before manually editing cache-tool sources,
+detach first; if already edited, remove just the `.lake/build` symlink before rebuilding.
+
+An unexpected dependency rebuild fails against the read-only tree; it never writes into
+another consumer's snapshot. Missing stored files report an error: detach and rebuild
+privately, rather than repairing a published snapshot. Store contents are trusted local
+user data, not a security boundary against the same user changing permissions.
+Do not run builds and cache restoration concurrently in the **same** project.
+
+Successful `lake clean mathlib` detachment requires Lake's root-directory-symlink cleanup
+fix; without it, Lake attempts to traverse the frozen tree and clean fails with permission
+denied. Use `lake exe cache detach` before cleaning with an older Lake.
+`cache clean`/`clean!` remove only compressed archives, never snapshots. Do not move or
+remove a snapshot while projects reference it. There is no automatic snapshot garbage
+collector; killed preparations can leave ignored `.tmp.*` directories under `builds-v2`.
+Killed attachments can also leave `.cache-attach.*` directories in the dependency's `.lake`.
+Remove abandoned temporary directories only when no cache commands are running.
 
 ## How It Works
 

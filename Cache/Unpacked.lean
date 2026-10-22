@@ -12,7 +12,7 @@ namespace Cache.Unpacked
 
 open System (FilePath)
 
-/-- Experimental, POSIX-only sharing of unpacked Mathlib dependency outputs. -/
+/-- One inherited setting enables sharing for all downstream projects. -/
 def enabled : IO Bool := do
   match ← IO.getEnv "MATHLIB_CACHE_UNPACKED" with
   | none | some "" | some "0" => return false
@@ -26,113 +26,94 @@ def enabled : IO Bool := do
 private def run (cmd : String) (args : Array String) : IO String := do
   let out ← IO.Process.output { cmd, args }
   unless out.exitCode == 0 do
-    throw <| IO.userError s!"{cmd} failed ({out.exitCode}): {out.stderr}"
+    throw <| IO.userError s!"{cmd} failed ({out.exitCode}): {out.stderr}\n{out.stdout}"
   return out.stdout.trimAscii.toString
 
-/-- Versioned separately from the archive format; never used as a mutable build directory. -/
-def entryPath (cache : FilePath) (archive : FilePath) : FilePath :=
-  cache / "unpacked-v1" / archive.fileStem.getD archive.toString
+def entryPath (cache : FilePath) (key : UInt64) : FilePath :=
+  cache / "builds-v2" / key.asLTar
 
-/-- Only compiler payloads are shared. Traces, hashes, and other bookkeeping remain private. -/
-def isPayload (path : FilePath) : Bool :=
-  [".olean", ".olean.server", ".olean.private", ".ilean", ".ir", ".ir.sig", ".c"].any
-    (path.toString.endsWith ·)
+/-- Count regular files rather than keeping a per-artifact attachment manifest. -/
+private def fileCount (build : FilePath) : IO Nat := do
+  let mut count := 0
+  for path in ← build.walkDir do
+    match (← path.symlinkMetadata).type with
+    | .file => count := count + 1
+    | .dir => pure ()
+    | _ => throw <| IO.userError s!"Unexpected file type in build snapshot: {path}"
+  return count
 
-private def safePath (path : FilePath) : Bool :=
-  !path.isAbsolute && !(path.components.contains "..") &&
-    [".lake/build/lib/lean/Mathlib", ".lake/build/ir/Mathlib"].any fun base =>
-      path.toString.startsWith (base ++ "/") || path.toString.startsWith (base ++ ".")
+/-- Published directories are immutable. Missing outputs are errors, not cache hits. -/
+def readEntry (entry : FilePath) : IO Bool := do
+  if !(← entry.pathExists) then return false
+  let expected ← IO.FS.readFile (entry / "files")
+  let actual ← fileCount (entry / "build")
+  unless actual > 0 && expected == toString actual do
+    throw <| IO.userError s!"Incomplete build snapshot: {entry}; detach and rebuild privately"
+  return true
 
-/-- An entry is visible only after its complete directory has been atomically published. -/
-def readEntry (entry : FilePath) : IO (Option (Array FilePath)) := do
-  if !(← entry.pathExists) then return none
-  let manifest := entry / "manifest.json"
-  let json ← IO.ofExcept <| Lean.Json.parse (← IO.FS.readFile manifest)
-  let paths ← IO.ofExcept <| Lean.fromJson? (α := Array String) json
-  let paths := paths.map FilePath.mk
-  if paths.isEmpty then
-    throw <| IO.userError s!"Empty unpacked cache entry: {entry}"
-  for path in paths do
-    unless safePath path do
-      throw <| IO.userError s!"Invalid unpacked cache path: {entry / path}"
-    unless (← (entry / path).symlinkMetadata).type == .file do
-      throw <| IO.userError s!"Incomplete or invalid unpacked cache entry: {entry / path}"
-  return some paths
-
-private def removeFileIfExists (path : FilePath) : IO Unit := do
-  try IO.FS.removeFile path
-  catch
-    | .noFileOrDirectory .. => pure ()
+/-- Removing the reference never traverses the canonical build directory. -/
+def detach (base : FilePath) : IO Bool := do
+  let build := base / ".lake/build"
+  let metadata ← try some <$> build.symlinkMetadata catch
+    | .noFileOrDirectory .. => pure none
     | e => throw e
+  if metadata.any (·.type == .symlink) then
+    let source : FilePath ← run "readlink" #["--", build.toString]
+    unless source.fileName == some "build" &&
+        (source.parent.bind (·.parent) |>.bind (·.fileName)) == some "builds-v2" do
+      return false
+    IO.FS.removeFile build
+    IO.println s!"Detached {build}; subsequent builds are private"
+    return true
+  return false
 
-private def replace (source target : FilePath) (link : Bool) : IO Unit := do
-  if let some parent := target.parent then IO.FS.createDirAll parent
-  let temp := target.addExtension s!"cache-{← IO.Process.getPID}.tmp"
-  -- A failed prior attachment can leave a temporary symlink, including a dangling one.
-  removeFileIfExists temp
+/-- Atomically install one directory reference, replacing only this package's build outputs. -/
+def attach (entry base : FilePath) : IO Unit := do
+  let source ← IO.FS.realPath (entry / "build")
+  let build := base / ".lake/build"
+  if ← build.pathExists then
+    if (← build.symlinkMetadata).type == .symlink then
+      if (← IO.FS.realPath build) == source then return
+  IO.FS.createDirAll (base / ".lake")
+  let temp : FilePath ← run "mktemp" #["-d", (base / ".lake/.cache-attach.XXXXXXXXXX").toString]
   try
-    if link then
-      discard <| run "ln" #["-s", "--", source.toString, temp.toString]
-    else
-      IO.FS.writeBinFile temp (← IO.FS.readBinFile source)
-    IO.FS.rename temp target
+    discard <| run "ln" #["-s", "--", source.toString, (temp / "link").toString]
+    try
+      IO.FS.rename build (temp / "previous")
+    catch
+      | .noFileOrDirectory .. => pure ()
+      | e => throw e
+    IO.FS.rename (temp / "link") build
   finally
-    removeFileIfExists temp
+    if !(← build.pathExists) && (← (temp / "previous").pathExists) then
+      IO.FS.rename (temp / "previous") build
+    -- Unlike recursive directory traversal, rm does not follow directory symlinks.
+    discard <| run "rm" #["-rf", "--", temp.toString]
 
-/-- Attach immutable payloads individually; never link a build directory or mutable metadata.
-When `privateCopy` is set, detach payloads as well, before a forced extraction can overwrite them. -/
-def attach (entry base : FilePath) (paths : Array FilePath) (privateCopy := false) : IO Unit := do
-  let entry ← IO.FS.realPath entry
-  -- An interrupted restore must not leave an old trace certifying new payloads.
-  for path in paths.filter (·.extension == some "trace") do
-    removeFileIfExists (base / path)
-  for path in paths.filter (·.extension != some "trace") do
-    replace (entry / path) (base / path) (isPayload path && !privateCopy)
-  for path in paths.filter (·.extension == some "trace") do
-    replace (entry / path) (base / path) false
-
-/-- Collect only files beneath the supported Mathlib build layout. -/
-def extractedPaths (staging : FilePath) : IO (Array FilePath) := do
-  let mut paths := #[]
-  for path in ← staging.walkDir do
-    if (← path.symlinkMetadata).type == .file && safePath (path.withoutParent staging) then
-      paths := paths.push (path.withoutParent staging)
-  unless paths.any (·.extension == some "trace") &&
-      paths.any (·.extension == some "olean") do
-    throw <| IO.userError s!"Incomplete Mathlib extraction in {staging}"
-  return paths
-
-/-- Prepare privately and publish with directory rename. Concurrent losers reuse the winner;
-an interrupted preparation leaves only an ignored `.tmp.*` directory. Existing entries are
-never replaced, including by force-fetch. The callback extracts only into the staging directory. -/
-def prepare (cache archive : FilePath) (extract : FilePath → IO Unit) :
-    IO (FilePath × Array FilePath) := do
-  let entry := entryPath cache archive
-  if let some paths ← readEntry entry then return (entry, paths)
-  let root := cache / "unpacked-v1"
+/-- Capture a complete prepared build, including its ordinary cache executable. Publication
+is a directory rename; failed or concurrent preparations cannot modify a published tree. -/
+def prepare (cache : FilePath) (key : UInt64) (build : FilePath) : IO FilePath := do
+  let entry := entryPath cache key
+  if ← readEntry entry then return entry
+  let root := cache / "builds-v2"
   IO.FS.createDirAll root
   let staging : FilePath ← run "mktemp" #["-d", (root / ".tmp.XXXXXXXXXX").toString]
   try
-    extract staging
-    let paths ← extractedPaths staging
-    for path in paths do
-      unless (← (staging / path).metadata).type == .file do
-        throw <| IO.userError s!"Unexpected unpacked cache file: {staging / path}"
-      if isPayload path then
-        discard <| run "chmod" #["a-w", "--", (staging / path).toString]
-    IO.FS.writeFile (staging / "manifest.json") (Lean.toJson (paths.map (·.toString))).compress
+    discard <| run "cp" #["-RL", "--", build.toString, (staging / "build").toString]
+    let count ← fileCount (staging / "build")
+    unless count > 0 do throw <| IO.userError "Cannot publish an empty build snapshot"
+    IO.FS.writeFile (staging / "files") (toString count)
+    discard <| run "chmod" #["-R", "a-w", "--", staging.toString]
     try
       IO.FS.rename staging entry
     catch
       | e@(.alreadyExists ..) | e@(.unsatisfiedConstraints ..) =>
-        if !(← entry.pathExists) then throw e
-        -- rename cannot replace a populated directory. Validate the concurrent winner.
-        discard <| readEntry entry
+        if !(← readEntry entry) then throw e
       | e => throw e
-    let some paths ← readEntry entry
-      | throw <| IO.userError s!"Unpacked cache publication disappeared: {entry}"
-    return (entry, paths)
+    return entry
   finally
-    if ← staging.pathExists then IO.FS.removeDirAll staging
+    if ← staging.pathExists then
+      discard <| run "chmod" #["-R", "u+w", "--", staging.toString]
+      IO.FS.removeDirAll staging
 
 end Cache.Unpacked

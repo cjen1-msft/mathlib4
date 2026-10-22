@@ -1058,21 +1058,14 @@ appropriate missing-files guidance (see `warnIfMissingFiles`).
 resolves the locations to try, including endpoint and container overrides,
 explicit scopes, and the forks HEAD fallback. Without an override, the fork
 lookup chain starts with `master`, which supplies shared upstream artifacts. -/
-def getFiles
+private def getFilesCore
     (repo : String) (hashMap : IO.ModuleHashMap)
     (forceDownload forceUnpack : Bool) (mode : IO.CurlMode) (decompress : Bool)
     (unsafeScopes : List String := [])
     : IO.CacheM Nat := do
   let isMathlibRoot ← IO.isMathlibRoot
-  unless isMathlibRoot do
-    checkForToolchainMismatch
-    checkForManifestMismatch
-
   let mathlibDepPath := (← read).mathlibDepPath
   let startTime ← IO.monoMsNow
-  let hashMap ← if decompress && !forceDownload && !forceUnpack then
-    IO.restoreUnpacked hashMap
-  else pure hashMap
 
   -- Start background decompression of already-cached files before downloading.
   -- Skip when forceDownload is set, since downloadFiles will re-download (and pipeline-decompress)
@@ -1122,6 +1115,66 @@ def getFiles
   else
     IO.println s!"Downloaded all available files ({result.missing} not in the cache)."
   return result.missing
+
+/-- Share only exact, unmodified packages. Module hashes cover sources, transitive imports,
+toolchain and Mathlib configuration; the revision also covers the captured cache executable. -/
+private def buildSnapshotKey? (hashMap : IO.ModuleHashMap) : IO.CacheM (Option UInt64) := do
+  let base := (← read).mathlibDepPath
+  let status ← IO.runCmd "git" #["-C", base.toString, "status", "--porcelain", "--untracked-files=all"]
+  unless status.trimAscii.isEmpty do
+    IO.println "Mathlib has local changes; restoring privately instead of sharing its build directory"
+    return none
+  let revision ← IO.runCmd "git" #["-C", base.toString, "rev-parse", "HEAD"]
+  let inputs := hashMap.toArray.qsort (fun a b => a.1.toString < b.1.toString)
+  return some <| hash (revision.trimAscii.toString, Lean.githash, System.Platform.target, inputs)
+
+/-- A snapshot captures the whole prepared tree, not just the requested modules. Ask Lake
+to validate any pre-existing modules too, rather than publishing stale unrelated outputs. -/
+private def validateBuild (base : System.FilePath) : IO Unit := do
+  let leanDir := base / ".lake/build/lib/lean"
+  let mut targets := #[]
+  for path in ← leanDir.walkDir do
+    if path.extension == some "olean" then
+      let name := ".".intercalate (path.withoutParent leanDir |>.withExtension "").components
+      targets := targets.push s!"+{name}"
+  discard <| IO.runCmd "lake" (#["--rehash", "build", "cache"] ++ targets)
+
+/-- Automatically share one immutable dependency build directory. Root outputs and other
+dependencies remain private. Force/disabled/edited-package restores detach before writing. -/
+def getFiles
+    (repo : String) (hashMap : IO.ModuleHashMap)
+    (forceDownload forceUnpack : Bool) (mode : IO.CurlMode) (decompress : Bool)
+    (unsafeScopes : List String := [])
+    : IO.CacheM Nat := do
+  if ← IO.isMathlibRoot then
+    return ← getFilesCore repo hashMap forceDownload forceUnpack mode decompress unsafeScopes
+  checkForToolchainMismatch
+  checkForManifestMismatch
+  if !decompress then
+    return ← getFilesCore repo hashMap forceDownload forceUnpack mode false unsafeScopes
+  let base := (← read).mathlibDepPath
+  let share ← Cache.Unpacked.enabled
+  let key? ← if share && !forceDownload && !forceUnpack then buildSnapshotKey? hashMap
+    else pure none
+  if let some key := key? then
+    let entry := Cache.Unpacked.entryPath IO.CACHEDIR key
+    if ← Cache.Unpacked.readEntry entry then
+      let privateDeps := hashMap.filter fun mod _ => !IO.isFromMathlib mod
+      let missing ← getFilesCore repo privateDeps false false mode true unsafeScopes
+      Cache.Unpacked.attach entry base
+      IO.println s!"Reused shared Mathlib build snapshot: {entry}"
+      return missing
+  discard <| Cache.Unpacked.detach base
+  let missing ← getFilesCore repo hashMap forceDownload forceUnpack mode true unsafeScopes
+  if let some key := key? then
+    if missing == 0 then
+      validateBuild base
+      unless (← buildSnapshotKey? hashMap) == some key do
+        throw <| IO.userError "Mathlib inputs changed while preparing its build snapshot"
+      let entry ← Cache.Unpacked.prepare IO.CACHEDIR key (base / ".lake/build")
+      Cache.Unpacked.attach entry base
+      IO.println s!"Published shared Mathlib build snapshot: {entry}"
+  return missing
 
 end Get
 

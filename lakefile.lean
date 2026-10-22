@@ -194,6 +194,21 @@ post_update pkg do
   let rootPkg ← getRootPackage
   if rootPkg.baseName = pkg.baseName then
     return -- do not run in Mathlib itself
+  -- The cache tool must be writable/rebuildable before its own code can run.
+  let detachSnapshot : IO Unit := do
+    try
+      if !System.Platform.isWindows && (← pkg.buildDir.symlinkMetadata).type == .symlink then
+        let out ← IO.Process.output { cmd := "readlink", args := #["--", pkg.buildDir.toString] }
+        unless out.exitCode == 0 do
+          throw <| IO.userError s!"Could not inspect Mathlib build reference: {out.stderr}"
+        let buildTarget : System.FilePath := out.stdout.trimAscii.toString
+        if buildTarget.fileName == some "build" &&
+            (buildTarget.parent.bind (·.parent) |>.bind (·.fileName)) == some "builds-v2" then
+          IO.FS.removeFile pkg.buildDir
+    catch
+      | .noFileOrDirectory .. => pure ()
+      | e => throw e
+  detachSnapshot
   if (← IO.getEnv "MATHLIB_NO_CACHE_ON_UPDATE") != some "1" then
     -- Check if Lake version matches toolchain version
     let toolchainFile := rootPkg.dir / "lean-toolchain"

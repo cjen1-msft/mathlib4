@@ -29,6 +29,7 @@ Commands:
   pack!          Compress build files into the local cache (no skipping)
   unpack         Decompress linked already downloaded files
   unpack!        Decompress linked already downloaded files (no skipping)
+  detach         Remove this project's shared Mathlib build reference; rebuild privately
   clean          Delete non-linked files
   clean!         Delete everything on the local cache
   lookup [ARGS]  Show information about cache files for the given Lean files
@@ -93,6 +94,7 @@ Valid arguments are:
 # Environment variables
 
 * MATHLIB_CACHE_DIR       Local cache directory (default: ~/.cache/mathlib)
+* MATHLIB_CACHE_UNPACKED  Set to 1 globally to share immutable dependency build directories
 * MATHLIB_CACHE_GET_URL   Download from this single URL as a flat namespace.
                           Allows third parties to use their own cache endpoint.
                           An empty value means unset.
@@ -234,6 +236,11 @@ def main (args : List String) : IO Unit := do
       [--repo=OWNER/REPO] [--scope=REF] [--backend=NAME]"
     Process.exit 1
   | _ => pure ()
+
+  if args == ["detach"] || args == ["unpack"] || args == ["unpack!"] then
+    unless ← isMathlibRoot do
+      discard <| Cache.Unpacked.detach (← read).mathlibDepPath
+    if args == ["detach"] then return
 
   let mut roots : Std.HashMap Lean.Name FilePath ← parseArgs args
   if roots.isEmpty then do

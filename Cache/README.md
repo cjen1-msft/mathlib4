@@ -126,10 +126,48 @@ lake exe cache get --cache-from=master,forks
 | Variable                         | Description                        | Default                                         |
 |----------------------------------|------------------------------------|-------------------------------------------------|
 | `MATHLIB_CACHE_DIR`              | Directory for cached `.ltar` files | `$XDG_CACHE_HOME/mathlib` or `~/.cache/mathlib` |
+| `MATHLIB_CACHE_UNPACKED`         | Experimental POSIX-only sharing of unpacked Mathlib dependency outputs (`0` or `1`) | `0` |
 | `MATHLIB_CACHE_GET_URL`          | Download from this single URL as a flat namespace (see [Operating an external cache](#operating-an-external-cache)) | unset |
 
 An empty value means unset. The upload variables are internal to mathlib CI;
 see [`CI.md`](./CI.md).
+
+### Experimental unpacked sharing
+
+On POSIX systems, run `MATHLIB_CACHE_UNPACKED=1 lake exe cache get ...` in a
+**downstream project** to share unpacked Mathlib compiler payloads across projects.
+This prototype requires `mktemp`, `ln`, and `chmod` on `PATH`. It does not require
+changes to Lake. It does not share the root project's outputs, other dependency
+packages, or entire build directories. The default extraction behavior is unchanged.
+
+Entries live in `$MATHLIB_CACHE_DIR/unpacked-v1/<module-cache-hash>/` (using the
+usual default cache directory when unset). The existing module hash includes source,
+transitive imports, toolchain, and package configuration. Each archive is extracted
+into a private temporary directory and atomically published. Concurrent preparations
+may extract twice but only one complete entry is published; later consumers reuse
+that unpacked entry without extraction, even after its `.ltar` is removed.
+
+Only `.olean`, `.olean.server`, `.olean.private`, `.ilean`, `.ir`, `.ir.sig`, and
+`.c` payloads are linked, individually, using absolute symlinks. Stored payloads are
+read-only. Traces, hashes, and other bookkeeping are private copies, with traces
+installed last. Existing regular payloads are treated as locally owned and ordinary
+reads leave that module alone. `get!` and `unpack!` extract privately and replace
+project links with regular writable copies; they never overwrite a published entry.
+Use a forced read before editing/rebuilding a linked Mathlib dependency if its build
+tools write outputs in place: such writes otherwise fail on the read-only target
+rather than corrupt another project. Project/root builds remain ordinary writable
+builds. Do not run builds and cache restoration concurrently in the **same** project.
+Disabling the option does not detach existing symlinks; keep it enabled for a forced
+read to obtain independent writable copies.
+
+Cleaning one project's build tree does not affect another. Missing project links
+can be restored by an ordinary `get`; a damaged published entry instead reports an
+error and must be investigated, not overwritten in place. Do not move or remove
+the shared store while projects link to it. `cache clean`/`clean!` remove compressed
+archives only, not this store; this prototype has no shared-entry garbage collector.
+Killed preparations can leave ignored `.tmp.*` directories beneath `unpacked-v1`;
+remove only those abandoned directories once no cache processes are running.
+The store is trusted local user data, not a security boundary against that user.
 
 ## How It Works
 

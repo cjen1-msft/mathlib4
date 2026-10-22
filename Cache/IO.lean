@@ -6,6 +6,7 @@ Authors: Arthur Paulino, Jon Eugster
 module
 
 public import Cache.Lean
+public import Cache.Unpacked
 public import Lake.Load.Toml
 
 import Batteries.Tactic.OpenPrivate
@@ -139,12 +140,42 @@ def getLeanTar : BaseIO String := return leantarSysrootBin
 
 /-- Spawn a `leantar` process for decompression, writing the given JSON config to its stdin.
     Returns the process exit code. -/
-def spawnLeanTarDecompress (config : Array Lean.Json) (force : Bool) : IO UInt32 := do
+private def spawnLeanTarDecompressDirect (config : Array Lean.Json) (force : Bool) : IO UInt32 := do
   let args := (if force then #["-f"] else #[]) ++ #["-x", "--delete-corrupted", "-j", "-"]
   let child ← IO.Process.spawn { cmd := ← getLeanTar, args, stdin := .piped }
   let (stdin, child) ← child.takeStdin
   stdin.putStr <| Lean.Json.compress <| .arr config
   child.wait
+
+/-- All extraction paths use this wrapper, including background and pipelined downloads.
+Only redirected Mathlib dependency entries participate in the opt-in unpacked store. -/
+def spawnLeanTarDecompress (config : Array Lean.Json) (force : Bool) : IO UInt32 := do
+  unless ← Cache.Unpacked.enabled do return ← spawnLeanTarDecompressDirect config force
+  let mut localConfig := #[]
+  for item in config do
+    match item.getObjValAs? String "file", item.getObjValAs? String "base" with
+    | .ok archive, .ok base =>
+      let archive : FilePath := archive
+      if force then
+        -- Never let leantar write through a workspace symlink, even when this key
+        -- has no published entry (e.g. after a source edit).
+        IO.FS.withTempDir fun staging => do
+          let code ← spawnLeanTarDecompressDirect
+            #[.mkObj [("file", archive.toString), ("base", staging.toString)]] true
+          unless code == 0 do
+            throw <| IO.userError s!"leantar failed preparing {archive} (exit code {code})"
+          Cache.Unpacked.attach staging base (← Cache.Unpacked.extractedPaths staging)
+            (privateCopy := true)
+      else
+        let (entry, paths) ← Cache.Unpacked.prepare CACHEDIR archive fun staging => do
+          let code ← spawnLeanTarDecompressDirect
+            #[.mkObj [("file", archive.toString), ("base", staging.toString)]] true
+          unless code == 0 do
+            throw <| IO.userError s!"leantar failed preparing {archive} (exit code {code})"
+        Cache.Unpacked.attach entry base paths
+    | _, _ => localConfig := localConfig.push item
+  if localConfig.isEmpty then return 0
+  spawnLeanTarDecompressDirect localConfig force
 
 /-- Bump this number to invalidate the cache, in case the existing hashing inputs are insufficient.
 It is not a global counter, and can be reset to 0 as long as the lean githash or lake manifest has
@@ -433,6 +464,24 @@ def getLocalCacheSet : IO <| Std.TreeSet String compare := do
 def isFromMathlib (mod : Name) : Bool :=
   mod.getRoot == `Mathlib
 
+/-- Restore complete shared entries before deciding which archives need downloading.
+Root builds, non-Mathlib dependencies, download-only, and forced reads remain independent. -/
+def restoreUnpacked (hashMap : ModuleHashMap) : CacheM ModuleHashMap := do
+  unless ← Cache.Unpacked.enabled do return hashMap
+  if ← isMathlibRoot then return hashMap
+  let base := (← read).mathlibDepPath
+  let remaining ← hashMap.foldM (init := ∅) fun remaining mod hash => do
+    if isFromMathlib mod then
+      let entry := Cache.Unpacked.entryPath CACHEDIR hash.asLTar
+      if let some paths ← Cache.Unpacked.readEntry entry then
+        Cache.Unpacked.attach entry base paths
+        return remaining
+    return remaining.insert mod hash
+  if remaining.size < hashMap.size then
+    IO.println s!"Found {hashMap.size - remaining.size} unpacked Mathlib cache entries \
+      (locally owned outputs preserved)"
+  return remaining
+
 /-- Get the trace file path for a module. -/
 def getTracePath (mod : Name) : CacheM FilePath := do
   let sp := (← read).srcSearchPath
@@ -530,6 +579,7 @@ def prepareDecompConfig (hashMap : ModuleHashMap) (force : Bool) :
 
 /-- Decompresses build files into their respective folders -/
 def unpackCache (hashMap : ModuleHashMap) (force : Bool) : CacheM Unit := do
+  let hashMap ← if force then pure hashMap else restoreUnpacked hashMap
   let hashMap ← hashMap.filterExists true
   let totalCached := hashMap.size
   -- Unless force is set, filter to only modules that actually need decompression

@@ -1070,6 +1070,9 @@ def getFiles
 
   let mathlibDepPath := (← read).mathlibDepPath
   let startTime ← IO.monoMsNow
+  let hashMap ← if decompress && !forceDownload && !forceUnpack then
+    IO.restoreUnpacked hashMap
+  else pure hashMap
 
   -- Start background decompression of already-cached files before downloading.
   -- Skip when forceDownload is set, since downloadFiles will re-download (and pipeline-decompress)

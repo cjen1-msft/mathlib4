@@ -1904,7 +1904,80 @@ def test_transferDiagnostics : IO Unit := do
 
 end TransferDiagnostics
 
+/-- Local filesystem regressions for the opt-in unpacked store; no network or real archives. -/
+def test_unpackedStore : IO Unit := do
+  IO.println "unpacked store:"
+  assertTrue "compiler payloads are shared" (Unpacked.isPayload "A.olean.private")
+  assertTrue "traces stay private" (!Unpacked.isPayload "A.trace")
+  assertTrue "hashes stay private" (!Unpacked.isPayload "A.olean.hash")
+  if System.Platform.isWindows then return
+  IO.FS.withTempDir fun dir => do
+    let payload : System.FilePath := ".lake/build/lib/lean/Mathlib/Example.olean"
+    let trace : System.FilePath := ".lake/build/lib/lean/Mathlib/Example.trace"
+    let extract := fun (staging : System.FilePath) => do
+      IO.FS.createDirAll (staging / ".lake/build/lib/lean/Mathlib")
+      IO.FS.writeFile (staging / payload) "immutable payload"
+      IO.FS.writeFile (staging / trace) "private trace"
+      IO.sleep 20
+    let first ← IO.asTask (Unpacked.prepare dir "0001.ltar" extract)
+    let second ← IO.asTask (Unpacked.prepare dir "0001.ltar" extract)
+    let (entry, paths) ← IO.ofExcept first.get
+    let (other, _) ← IO.ofExcept second.get
+    assertTrue "concurrent preparations publish one entry" (entry == other)
+    discard <| Unpacked.prepare dir "0001.ltar" fun _ =>
+      throw <| IO.userError "a published entry must not be extracted again"
+    let a := dir / "a"
+    let b := dir / "b"
+    Unpacked.attach entry a paths
+    Unpacked.attach entry b paths
+    assertTrue "payloads are symlinks" ((← (a / payload).symlinkMetadata).type == .symlink)
+    assertTrue "both consumers resolve to the same stored file"
+      ((← IO.FS.realPath (a / payload)) == (← IO.FS.realPath (b / payload)))
+    assertTrue "traces are ordinary private files" ((← (a / trace).symlinkMetadata).type == .file)
+    IO.FS.writeFile (a / trace) "changed trace"
+    assertEq "metadata writes do not touch the other consumer" "private trace"
+      (← IO.FS.readFile (b / trace))
+    IO.FS.removeFile (a / payload)
+    Unpacked.attach entry a paths
+    assertTrue "missing consumer output is relinked" (← (a / payload).pathExists)
+    let (changedEntry, changedPaths) ← Unpacked.prepare dir "0003.ltar" fun staging => do
+      extract staging
+      IO.FS.writeFile (staging / payload) "changed input"
+    Unpacked.attach changedEntry b changedPaths
+    assertEq "changed input links a distinct immutable entry" "changed input"
+      (← IO.FS.readFile (b / payload))
+    assertEq "changing one input leaves another consumer's old entry intact" "immutable payload"
+      (← IO.FS.readFile (a / payload))
+    Unpacked.attach entry b paths
+    Unpacked.attach entry a paths (privateCopy := true)
+    IO.FS.writeFile (a / payload) "local rebuild"
+    Unpacked.attach entry a paths
+    assertEq "ordinary reads preserve local regular outputs" "local rebuild"
+      (← IO.FS.readFile (a / payload))
+    assertEq "private rebuild cannot overwrite shared output" "immutable payload"
+      (← IO.FS.readFile (b / payload))
+    IO.FS.removeDirAll a
+    assertEq "cleaning one consumer leaves the other usable" "immutable payload"
+      (← IO.FS.readFile (b / payload))
+    let mut failed := false
+    try
+      discard <| Unpacked.prepare dir "0002.ltar" fun staging => do
+        extract staging
+        throw <| IO.userError "interrupted preparation"
+    catch _ => failed := true
+    assertTrue "failed preparation reports failure" failed
+    assertTrue "failed preparation is not published"
+      (!(← (Unpacked.entryPath dir "0002.ltar").pathExists))
+    discard <| Unpacked.prepare dir "0002.ltar" extract
+    assertTrue "a retry can publish a different input key"
+      (← (Unpacked.entryPath dir "0002.ltar").pathExists)
+    IO.FS.removeFile (entry / payload)
+    let mut rejected := false
+    try discard <| Unpacked.readEntry entry catch _ => rejected := true
+    assertTrue "missing stored output is an explicit error, never republished" rejected
+
 def runAll : IO Unit := do
+  test_unpackedStore
   test_Container_name
   test_Container_parse
   test_envValueNormalization

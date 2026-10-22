@@ -148,8 +148,9 @@ contents, imports, toolchain and Mathlib package configuration/dependency manife
 Local source/configuration changes select private restoration instead. Different requested
 module closures have separate snapshots; they are not incrementally merged.
 
-On a miss, cache restoration prepares a private build. Lake rehashes and validates its
-existing modules before the complete build tree is captured, including the ordinary cache
+On a miss, previous dependency build outputs are discarded and cache restoration prepares
+a fresh private build. Lake rehashes and validates every requested module before the complete
+build tree is captured, including the ordinary cache
 executable. The copy is frozen and atomically published; an interrupted preparation is never
 a visible snapshot. Concurrent preparers may duplicate work, but reuse one published entry.
 On a hit, one absolute symlink connects the dependency's `.lake/build` to that tree.

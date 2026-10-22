@@ -1128,15 +1128,10 @@ private def buildSnapshotKey? (hashMap : IO.ModuleHashMap) : IO.CacheM (Option U
   let inputs := hashMap.toArray.qsort (fun a b => a.1.toString < b.1.toString)
   return some <| hash (revision.trimAscii.toString, Lean.githash, System.Platform.target, inputs)
 
-/-- A snapshot captures the whole prepared tree, not just the requested modules. Ask Lake
-to validate any pre-existing modules too, rather than publishing stale unrelated outputs. -/
-private def validateBuild (base : System.FilePath) : IO Unit := do
-  let leanDir := base / ".lake/build/lib/lean"
-  let mut targets := #[]
-  for path in ← leanDir.walkDir do
-    if path.extension == some "olean" then
-      let name := ".".intercalate (path.withoutParent leanDir |>.withExtension "").components
-      targets := targets.push s!"+{name}"
+/-- Validate every requested module and build the ordinary cache executable before freezing. -/
+private def validateBuild (hashMap : IO.ModuleHashMap) : IO Unit := do
+  let targets := hashMap.toArray.filterMap fun (mod, _) =>
+    if IO.isFromMathlib mod then some s!"+{mod}" else none
   discard <| IO.runCmd "lake" (#["--rehash", "build", "cache"] ++ targets)
 
 /-- Automatically share one immutable dependency build directory. Root outputs and other
@@ -1165,10 +1160,13 @@ def getFiles
       IO.println s!"Reused shared Mathlib build snapshot: {entry}"
       return missing
   discard <| Cache.Unpacked.detach base
+  -- An interrupted extraction must not leave a new trace certifying an older payload.
+  if key?.isSome then
+    discard <| IO.runCmd "rm" #["-rf", "--", (base / ".lake/build").toString]
   let missing ← getFilesCore repo hashMap forceDownload forceUnpack mode true unsafeScopes
   if let some key := key? then
     if missing == 0 then
-      validateBuild base
+      validateBuild hashMap
       unless (← buildSnapshotKey? hashMap) == some key do
         throw <| IO.userError "Mathlib inputs changed while preparing its build snapshot"
       let entry ← Cache.Unpacked.prepare IO.CACHEDIR key (base / ".lake/build")

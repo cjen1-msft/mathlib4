@@ -478,8 +478,7 @@ def restoreUnpacked (hashMap : ModuleHashMap) : CacheM ModuleHashMap := do
         return remaining
     return remaining.insert mod hash
   if remaining.size < hashMap.size then
-    IO.println s!"Found {hashMap.size - remaining.size} unpacked Mathlib cache entries \
-      (locally owned outputs preserved)"
+    IO.println s!"Restored {hashMap.size - remaining.size} unpacked Mathlib cache entries"
   return remaining
 
 /-- Get the trace file path for a module. -/

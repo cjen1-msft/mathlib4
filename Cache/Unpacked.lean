@@ -40,8 +40,8 @@ def isPayload (path : FilePath) : Bool :=
 
 private def safePath (path : FilePath) : Bool :=
   !path.isAbsolute && !(path.components.contains "..") &&
-    (path.toString.startsWith ".lake/build/lib/lean/Mathlib/" ||
-     path.toString.startsWith ".lake/build/ir/Mathlib/")
+    [".lake/build/lib/lean/Mathlib", ".lake/build/ir/Mathlib"].any fun base =>
+      path.toString.startsWith (base ++ "/") || path.toString.startsWith (base ++ ".")
 
 /-- An entry is visible only after its complete directory has been atomically published. -/
 def readEntry (entry : FilePath) : IO (Option (Array FilePath)) := do
@@ -53,11 +53,13 @@ def readEntry (entry : FilePath) : IO (Option (Array FilePath)) := do
   if paths.isEmpty then
     throw <| IO.userError s!"Empty unpacked cache entry: {entry}"
   for path in paths do
-    unless safePath path && (← (entry / path).pathExists) do
+    unless safePath path do
+      throw <| IO.userError s!"Invalid unpacked cache path: {entry / path}"
+    unless (← (entry / path).symlinkMetadata).type == .file do
       throw <| IO.userError s!"Incomplete or invalid unpacked cache entry: {entry / path}"
   return some paths
 
-private def removeTemp (path : FilePath) : IO Unit := do
+private def removeFileIfExists (path : FilePath) : IO Unit := do
   try IO.FS.removeFile path
   catch
     | .noFileOrDirectory .. => pure ()
@@ -67,7 +69,7 @@ private def replace (source target : FilePath) (link : Bool) : IO Unit := do
   if let some parent := target.parent then IO.FS.createDirAll parent
   let temp := target.addExtension s!"cache-{← IO.Process.getPID}.tmp"
   -- A failed prior attachment can leave a temporary symlink, including a dangling one.
-  removeTemp temp
+  removeFileIfExists temp
   try
     if link then
       discard <| run "ln" #["-s", "--", source.toString, temp.toString]
@@ -75,19 +77,15 @@ private def replace (source target : FilePath) (link : Bool) : IO Unit := do
       IO.FS.writeBinFile temp (← IO.FS.readBinFile source)
     IO.FS.rename temp target
   finally
-    removeTemp temp
+    removeFileIfExists temp
 
 /-- Attach immutable payloads individually; never link a build directory or mutable metadata.
 When `privateCopy` is set, detach payloads as well, before a forced extraction can overwrite them. -/
 def attach (entry base : FilePath) (paths : Array FilePath) (privateCopy := false) : IO Unit := do
-  unless privateCopy do
-    -- A local rebuild or a forced fetch owns its regular payloads. Do not adopt them
-    -- into the store or replace them on a later ordinary read.
-    for path in paths.filter isPayload do
-      if ← (base / path).pathExists then
-        if (← (base / path).symlinkMetadata).type == .file then return
   let entry ← IO.FS.realPath entry
-  -- Install traces last, so interrupted attachment is not mistaken for a complete restore.
+  -- An interrupted restore must not leave an old trace certifying new payloads.
+  for path in paths.filter (·.extension == some "trace") do
+    removeFileIfExists (base / path)
   for path in paths.filter (·.extension != some "trace") do
     replace (entry / path) (base / path) (isPayload path && !privateCopy)
   for path in paths.filter (·.extension == some "trace") do

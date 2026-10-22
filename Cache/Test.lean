@@ -1917,13 +1917,28 @@ def test_unpackedStore : IO Unit := do
     let extract := fun (staging : System.FilePath) => do
       IO.FS.createDirAll (staging / ".lake/build/lib/lean/Mathlib")
       IO.FS.writeFile (staging / payload) "immutable payload"
+      IO.FS.writeFile (staging / ".lake/build/lib/lean/Mathlib/Example.ilean") "interface"
       IO.FS.writeFile (staging / trace) "private trace"
       IO.sleep 20
     let first ← IO.asTask (Unpacked.prepare dir "0001.ltar" extract)
     let second ← IO.asTask (Unpacked.prepare dir "0001.ltar" extract)
     let (entry, paths) ← IO.ofExcept first.get
-    let (other, _) ← IO.ofExcept second.get
-    assertTrue "concurrent preparations publish one entry" (entry == other)
+    let (other, otherPaths) ← IO.ofExcept second.get
+    assertTrue "concurrent preparations return the same complete entry"
+      (entry == other && paths == otherPaths)
+    -- Publish a winner while the outer preparation is still extracting.
+    discard <| Unpacked.prepare dir "0004.ltar" fun staging => do
+      discard <| Unpacked.prepare dir "0004.ltar" extract
+      extract staging
+    assertTrue "concurrent losers remove their staging directories"
+      (!((← (dir / "unpacked-v1").readDir).any (·.fileName.startsWith ".tmp.")))
+    let (rootEntry, rootPaths) ← Unpacked.prepare dir "0005.ltar" fun staging => do
+      IO.FS.createDirAll (staging / ".lake/build/lib/lean")
+      IO.FS.writeFile (staging / ".lake/build/lib/lean/Mathlib.olean") "umbrella"
+      IO.FS.writeFile (staging / ".lake/build/lib/lean/Mathlib.trace") "umbrella trace"
+    Unpacked.attach rootEntry (dir / "root-consumer") rootPaths
+    assertEq "the umbrella Mathlib module can be restored" "umbrella"
+      (← IO.FS.readFile (dir / "root-consumer/.lake/build/lib/lean/Mathlib.olean"))
     discard <| Unpacked.prepare dir "0001.ltar" fun _ =>
       throw <| IO.userError "a published entry must not be extracted again"
     let a := dir / "a"
@@ -1949,13 +1964,27 @@ def test_unpackedStore : IO Unit := do
     assertEq "changing one input leaves another consumer's old entry intact" "immutable payload"
       (← IO.FS.readFile (a / payload))
     Unpacked.attach entry b paths
+    let blocker := (a / trace).addExtension s!"cache-{← IO.Process.getPID}.tmp"
+    IO.FS.createDir blocker
+    let mut interrupted := false
+    try Unpacked.attach changedEntry a changedPaths catch _ => interrupted := true
+    assertTrue "an attachment failure is reported" interrupted
+    assertEq "the failure occurred after installing the changed payload" "changed input"
+      (← IO.FS.readFile (a / payload))
+    assertTrue "interrupted attachment invalidates the old trace" (!(← (a / trace).pathExists))
+    IO.FS.removeDir blocker
+    Unpacked.attach entry a paths
     Unpacked.attach entry a paths (privateCopy := true)
     IO.FS.writeFile (a / payload) "local rebuild"
-    Unpacked.attach entry a paths
-    assertEq "ordinary reads preserve local regular outputs" "local rebuild"
-      (← IO.FS.readFile (a / payload))
     assertEq "private rebuild cannot overwrite shared output" "immutable payload"
       (← IO.FS.readFile (b / payload))
+    IO.FS.removeFile (a / trace)
+    IO.FS.removeFile (a / payload)
+    Unpacked.attach entry a paths
+    assertEq "partial regular outputs do not prevent restoration" "immutable payload"
+      (← IO.FS.readFile (a / payload))
+    assertEq "partial regular outputs regain their trace" "private trace"
+      (← IO.FS.readFile (a / trace))
     IO.FS.removeDirAll a
     assertEq "cleaning one consumer leaves the other usable" "immutable payload"
       (← IO.FS.readFile (b / payload))
@@ -1964,17 +1993,27 @@ def test_unpackedStore : IO Unit := do
       discard <| Unpacked.prepare dir "0002.ltar" fun staging => do
         extract staging
         throw <| IO.userError "interrupted preparation"
-    catch _ => failed := true
+    catch e => failed := e.toString == "interrupted preparation"
     assertTrue "failed preparation reports failure" failed
     assertTrue "failed preparation is not published"
       (!(← (Unpacked.entryPath dir "0002.ltar").pathExists))
+    assertTrue "failed preparation removes its staging directory"
+      (!((← (dir / "unpacked-v1").readDir).any (·.fileName.startsWith ".tmp.")))
     discard <| Unpacked.prepare dir "0002.ltar" extract
     assertTrue "a retry can publish a different input key"
       (← (Unpacked.entryPath dir "0002.ltar").pathExists)
     IO.FS.removeFile (entry / payload)
     let mut rejected := false
-    try discard <| Unpacked.readEntry entry catch _ => rejected := true
-    assertTrue "missing stored output is an explicit error, never republished" rejected
+    try discard <| Unpacked.readEntry entry
+    catch
+      | .noFileOrDirectory .. => rejected := true
+      | _ => pure ()
+    assertTrue "missing stored output is an explicit error" rejected
+    IO.FS.createDir (entry / payload)
+    rejected := false
+    try discard <| Unpacked.prepare dir "0001.ltar" extract
+    catch e => rejected := e.toString.startsWith "Incomplete or invalid unpacked cache entry:"
+    assertTrue "directory substitutions are rejected, never republished" rejected
 
 def runAll : IO Unit := do
   test_unpackedStore

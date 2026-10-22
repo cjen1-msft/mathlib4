@@ -149,9 +149,11 @@ that unpacked entry without extraction, even after its `.ltar` is removed.
 
 Only `.olean`, `.olean.server`, `.olean.private`, `.ilean`, `.ir`, `.ir.sig`, and
 `.c` payloads are linked, individually, using absolute symlinks. Stored payloads are
-read-only. Traces, hashes, and other bookkeeping are private copies, with traces
-installed last. Existing regular payloads are treated as locally owned and ordinary
-reads leave that module alone. `get!` and `unpack!` extract privately and replace
+read-only. Traces, hashes, and other bookkeeping are private copies. Old traces
+are removed before restoration and new traces installed last, so interrupted
+restoration causes a rebuild rather than reuse of mismatched outputs. Restoration
+replaces existing build outputs, including regular files; source edits are untouched.
+`get!` and `unpack!` extract privately and replace
 project links with regular writable copies; they never overwrite a published entry.
 Use a forced read before editing/rebuilding a linked Mathlib dependency if its build
 tools write outputs in place: such writes otherwise fail on the read-only target
